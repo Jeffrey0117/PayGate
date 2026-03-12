@@ -1,46 +1,48 @@
 # PayGate
 
-CloudPipe 生態系的統一付款閘道。接收付款 Webhook、記錄購買狀態、供所有產品查詢「付了沒」。
+> **[中文版 README](README.zh-TW.md)**
+
+Unified payment gateway for the [CloudPipe](https://github.com/Jeffrey0117/CloudPipe) ecosystem. Receives payment webhooks, records purchase status, and lets any product check "has this user paid?"
 
 ```
 ┌──────────┐    ┌──────────┐    ┌──────────┐
-│ 金流平台  │───>│ PayGate  │───>│ Mailer   │  確認信
-│ (PayUni) │    │ (收銀台) │───>│ Telegram │  通知
+│ Payment  │───>│ PayGate  │───>│  Mailer  │  confirmation
+│ Provider │    │ (gateway)│───>│ Telegram │  notification
 └──────────┘    └──────────┘    └──────────┘
                      │
               ┌──────┴──────┐
-              │  任何產品    │
-              │  GET /check  │  「這用戶付了沒？」
+              │ Any product  │
+              │ GET /check   │  "has this user paid?"
               └─────────────┘
 ```
 
-**定位**：生態系的「收銀台」。所有產品（Pokkit、AutoCard、ReelScript...）共用一個付款狀態資料庫，不需要各自串金流。金流平台付款成功後打一次 Webhook，PayGate 就記錄完畢，任何產品都能用一行 API 查詢。
+All products (Pokkit, AutoCard, ReelScript...) share a single purchase database — no per-product payment integration needed. After the payment provider fires a webhook once, any product can check purchase status with a single API call.
 
-## 功能
+## Features
 
-- 接收付款 Webhook（支援 Classroo / PayUni 等金流來源）
-- order_id 冪等性檢查（同一筆訂單不重複入庫）
-- SQLite 購買記錄（WAL mode, better-sqlite3）
-- 公開查詢端點 `/api/purchases/check`（免 auth，不洩漏敏感資料）
-- 付款成功自動發確認信（透過 Mailer）+ Telegram 通知
-- 手動開通 `/api/activate`（管理員用）
-- 支援到期時間（`expires_at`），自動判斷過期
+- Payment webhook receiver (supports Classroo / PayUni and other providers)
+- `order_id` idempotency check (no duplicate inserts)
+- SQLite purchase records (WAL mode, better-sqlite3)
+- Public check endpoint `/api/purchases/check` (no auth, no sensitive data leaks)
+- Auto-sends confirmation email (via Mailer) + Telegram notification on purchase
+- Manual activation `/api/activate` (admin use)
+- Expiration support (`expires_at`) with automatic expiry checks
 
-## 快速啟動
+## Quick Start
 
 ```bash
 npm install
-cp .env.example .env   # 填入 token
+cp .env.example .env   # fill in tokens
 PORT=4019 node server.js
 ```
 
-## 環境變數
+## Environment Variables
 
-| 變數 | 必填 | 說明 |
-|------|------|------|
-| `PORT` | 否 | 伺服器端口（預設 4019）|
-| `PAYGATE_TOKEN` | 是 | 管理 API 的 Bearer token |
-| `PAYGATE_WEBHOOK_SECRET` | 是 | Webhook 驗證 token |
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PORT` | No | Server port (default: 4019) |
+| `PAYGATE_TOKEN` | Yes | Bearer token for admin API |
+| `PAYGATE_WEBHOOK_SECRET` | Yes | Bearer token for webhook auth |
 
 ## API
 
@@ -56,7 +58,7 @@ curl http://localhost:4019/api/health
 
 ### `POST /api/webhook`
 
-金流平台付款成功後呼叫。自動發確認信 + Telegram 通知。
+Called by the payment provider after successful payment. Automatically sends a confirmation email and Telegram notification.
 
 ```bash
 curl -X POST http://localhost:4019/api/webhook \
@@ -77,11 +79,11 @@ curl -X POST http://localhost:4019/api/webhook \
 { "success": true, "purchaseId": "pur_a1b2c3d4e5f6g7h8" }
 ```
 
-重複的 `order_id` 會回傳 `{ "duplicate": true }`，不重複入庫。
+Duplicate `order_id` returns `{ "duplicate": true }` without creating a new record.
 
 ### `GET /api/purchases/check?email=&product=`
 
-**公開端點**（不需 auth）。任何產品都能呼叫來確認用戶是否付費。
+**Public endpoint** (no auth). Any product can call this to verify if a user has paid.
 
 ```bash
 curl "http://localhost:4019/api/purchases/check?email=buyer@example.com&product=pokkit-pro"
@@ -91,7 +93,7 @@ curl "http://localhost:4019/api/purchases/check?email=buyer@example.com&product=
 { "active": true, "plan": "lifetime", "expires_at": null }
 ```
 
-或：
+Or:
 
 ```json
 { "active": false }
@@ -99,7 +101,7 @@ curl "http://localhost:4019/api/purchases/check?email=buyer@example.com&product=
 
 ### `GET /api/purchases/:email`
 
-列出某 email 的所有購買記錄（需 auth）。
+List all purchases for an email (requires auth).
 
 ```bash
 curl http://localhost:4019/api/purchases/buyer@example.com \
@@ -108,7 +110,7 @@ curl http://localhost:4019/api/purchases/buyer@example.com \
 
 ### `POST /api/activate`
 
-手動開通購買（管理員用途，不經過金流）。
+Manually activate a purchase (admin use, no payment webhook needed).
 
 ```bash
 curl -X POST http://localhost:4019/api/activate \
@@ -122,27 +124,27 @@ curl -X POST http://localhost:4019/api/activate \
   }'
 ```
 
-## 跨服務呼叫
+## Cross-Service Usage
 
-其他子專案透過 CloudPipe Gateway SDK 查詢付費狀態：
+Other sub-projects check purchase status via the CloudPipe Gateway SDK:
 
 ```javascript
 const gw = require('../../sdk/gateway');
 
-// 檢查用戶是否有效付費
+// Check if user has an active purchase
 const result = await gw.call('paygate_check', {
   email: 'user@example.com',
   product: 'my-product',
 });
 
 if (!result.active) {
-  return res.status(402).json({ error: '請先購買此產品' });
+  return res.status(402).json({ error: 'Please purchase this product first' });
 }
 ```
 
-## 資料庫
+## Database
 
-SQLite（`data/paygate.db`），WAL mode，`better-sqlite3`。
+SQLite (`data/paygate.db`), WAL mode, `better-sqlite3`.
 
 ```sql
 CREATE TABLE purchases (
@@ -154,26 +156,26 @@ CREATE TABLE purchases (
   amount      INTEGER DEFAULT 0,
   currency    TEXT DEFAULT 'TWD',
   paid_at     TEXT DEFAULT (datetime('now')),
-  expires_at  TEXT,                 -- NULL = 永久有效
+  expires_at  TEXT,                 -- NULL = never expires
   source      TEXT DEFAULT '',      -- payuni, manual, ...
-  order_id    TEXT,                 -- 冪等性用
-  raw_payload TEXT,                 -- Webhook 原始 JSON
+  order_id    TEXT,                 -- idempotency key
+  raw_payload TEXT,                 -- raw webhook JSON
   created_at  TEXT DEFAULT (datetime('now'))
 );
 ```
 
-索引：`email`、`product_id`、`order_id`。
+Indexes: `email`, `product_id`, `order_id`.
 
-## 技術架構
+## Architecture
 
 - **Runtime**: Node.js, CJS (`require` / `module.exports`)
-- **HTTP**: Node 內建 `http` 模組（無框架）
-- **DB**: `better-sqlite3`（WAL mode）
-- **通知**: fire-and-forget（不阻塞 Webhook 回應）
-  - 確認信：透過 `sdk/gateway.js` 呼叫 Mailer
-  - Telegram：透過 `sdk/telegram.js` 發送
-- **程式碼**: `server.js`（281 行）+ `db.js`（43 行）
+- **HTTP**: Node built-in `http` module (no framework)
+- **DB**: `better-sqlite3` (WAL mode)
+- **Notifications**: Fire-and-forget (non-blocking)
+  - Confirmation email: via `sdk/gateway.js` calling Mailer
+  - Telegram: via `sdk/telegram.js`
+- **Source**: `server.js` (281 lines) + `db.js` (43 lines)
 
-## 授權
+## License
 
 MIT
