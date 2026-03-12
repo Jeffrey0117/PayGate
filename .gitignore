@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.local
+.env.production
+*.db
+*.sqlite
+*.sqlite3
+data/
+uploads/
+storage/
+db/
+.pm2-start.cjs
+*.log
+.DS_Store
+Thumbs.db
