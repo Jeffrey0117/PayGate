@@ -1,6 +1,9 @@
 const http = require('http');
 const crypto = require('crypto');
 const { getDb } = require('./db');
+const { listPlans, upsertPlan, deletePlan } = require('./plans');
+const { subscribe, checkSubscription, cancelSubscription, expireCheck, handlePurchaseForSubscription } = require('./subscriptions');
+const { registerHook, listHooks, deleteHook } = require('./hooks');
 
 const PORT = parseInt(process.env.PORT || '4019', 10);
 
@@ -23,7 +26,7 @@ function json(res, status, data) {
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   });
   res.end(payload);
@@ -141,7 +144,22 @@ async function handleWebhook(req, res) {
     }
   });
 
-  return json(res, 200, { success: true, purchaseId });
+  // Check if this purchase maps to a subscription plan
+  let subscription = null;
+  try {
+    subscription = handlePurchaseForSubscription(body.email, body.product_id);
+    if (subscription) {
+      console.log(`[paygate] Subscription created/extended: ${subscription.email} -> ${subscription.tier}`);
+    }
+  } catch (err) {
+    console.error('[paygate] Subscription processing error:', err.message);
+  }
+
+  return json(res, 200, {
+    success: true,
+    purchaseId,
+    subscription: subscription ? { id: subscription.id, tier: subscription.tier } : undefined,
+  });
 }
 
 async function handleCheck(req, res) {
@@ -218,6 +236,99 @@ async function handleActivate(req, res) {
   return json(res, 200, { success: true, purchaseId });
 }
 
+// ─── Plans Handlers ───
+
+async function handleListPlans(req, res) {
+  const query = parseQuery(req.url);
+  const plans = listPlans(query.product);
+  return json(res, 200, { plans });
+}
+
+async function handleCreatePlan(req, res) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  const body = await readBody(req);
+  const plan = upsertPlan(body);
+  return json(res, 200, { success: true, plan });
+}
+
+async function handleDeletePlan(req, res, id) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  deletePlan(id);
+  return json(res, 200, { success: true });
+}
+
+// ─── Subscription Handlers ───
+
+async function handleCheckSubscription(req, res) {
+  const query = parseQuery(req.url);
+  if (!query.email || !query.product) {
+    return json(res, 400, { error: 'email and product query params are required' });
+  }
+  const result = checkSubscription(query.email, query.product);
+  return json(res, 200, result);
+}
+
+async function handleSubscribe(req, res) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  const body = await readBody(req);
+  if (!body.email || !body.product || !body.plan_id) {
+    return json(res, 400, { error: 'email, product, plan_id are required' });
+  }
+  const sub = subscribe(body.email, body.product, body.plan_id);
+  return json(res, 200, { success: true, subscription: sub });
+}
+
+async function handleCancelSubscription(req, res, id) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  const body = await readBody(req).catch(() => ({}));
+  const sub = cancelSubscription(id, body.reason);
+  return json(res, 200, { success: true, subscription: sub });
+}
+
+async function handleExpireCheck(req, res) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  const result = expireCheck();
+  return json(res, 200, result);
+}
+
+// ─── Hook Handlers ───
+
+async function handleCreateHook(req, res) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  const body = await readBody(req);
+  const hook = registerHook(body);
+  return json(res, 200, { success: true, hook });
+}
+
+async function handleListHooks(req, res) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  const query = parseQuery(req.url);
+  const hooks = listHooks(query.product);
+  return json(res, 200, { hooks });
+}
+
+async function handleDeleteHook(req, res, id) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  deleteHook(id);
+  return json(res, 200, { success: true });
+}
+
 // ─── Router ───
 
 function matchRoute(method, pathname) {
@@ -243,6 +354,45 @@ function matchRoute(method, pathname) {
     return { handler: handleListPurchases, params: [email] };
   }
 
+  // Plans
+  if (method === 'GET' && pathname === '/api/plans') {
+    return { handler: handleListPlans };
+  }
+  if (method === 'POST' && pathname === '/api/plans') {
+    return { handler: handleCreatePlan };
+  }
+  const planDeleteMatch = pathname.match(/^\/api\/plans\/(.+)$/);
+  if (method === 'DELETE' && planDeleteMatch) {
+    return { handler: handleDeletePlan, params: [decodeURIComponent(planDeleteMatch[1])] };
+  }
+
+  // Subscriptions
+  if (method === 'GET' && pathname === '/api/subscription/check') {
+    return { handler: handleCheckSubscription };
+  }
+  if (method === 'POST' && pathname === '/api/subscribe') {
+    return { handler: handleSubscribe };
+  }
+  if (method === 'POST' && pathname === '/api/subscriptions/expire-check') {
+    return { handler: handleExpireCheck };
+  }
+  const subDeleteMatch = pathname.match(/^\/api\/subscription\/([^/]+)$/);
+  if (method === 'DELETE' && subDeleteMatch && subDeleteMatch[1] !== 'check') {
+    return { handler: handleCancelSubscription, params: [subDeleteMatch[1]] };
+  }
+
+  // Hooks
+  if (method === 'POST' && pathname === '/api/hooks') {
+    return { handler: handleCreateHook };
+  }
+  if (method === 'GET' && pathname === '/api/hooks') {
+    return { handler: handleListHooks };
+  }
+  const hookDeleteMatch = pathname.match(/^\/api\/hooks\/([^/]+)$/);
+  if (method === 'DELETE' && hookDeleteMatch) {
+    return { handler: handleDeleteHook, params: [hookDeleteMatch[1]] };
+  }
+
   return null;
 }
 
@@ -253,7 +403,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     });
     return res.end();
