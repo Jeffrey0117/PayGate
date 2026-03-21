@@ -28,55 +28,56 @@ function subscribe(email, product, planId) {
   const cycleDays = getCycleDays(plan.billing_cycle);
   const now = new Date().toISOString();
 
-  const existing = db.prepare(
-    'SELECT s.*, p.price as current_price FROM subscriptions s LEFT JOIN plans p ON s.plan_id = p.id WHERE s.email = ? AND s.product = ?'
-  ).get(email, product);
+  // Wrap in transaction to prevent race conditions
+  const sub = db.transaction(() => {
+    const existing = db.prepare(
+      'SELECT s.*, p.price as current_price FROM subscriptions s LEFT JOIN plans p ON s.plan_id = p.id WHERE s.email = ? AND s.product = ?'
+    ).get(email, product);
 
-  let sub;
-
-  if (!existing) {
-    // New subscription
-    const id = genSubId();
-    const endDate = cycleDays ? addDays(now, cycleDays) : null;
-    db.prepare(`
-      INSERT INTO subscriptions (id, email, product, plan_id, tier, status, start_date, end_date)
-      VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
-    `).run(id, email, product, planId, plan.tier, now, endDate);
-    sub = db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(id);
-
-  } else if (existing.status === 'active') {
-    // Active: extend or upgrade (never downgrade)
-    const baseDate = existing.end_date && new Date(existing.end_date) > new Date(now)
-      ? existing.end_date : now;
-    const newEnd = cycleDays ? addDays(baseDate, cycleDays) : null;
-
-    if (plan.price >= (existing.current_price || 0)) {
-      // Same tier or upgrade: switch plan + extend
+    if (!existing) {
+      // New subscription
+      const id = genSubId();
+      const endDate = cycleDays ? addDays(now, cycleDays) : null;
       db.prepare(`
-        UPDATE subscriptions SET plan_id = ?, tier = ?, end_date = ?, status = 'active'
-        WHERE email = ? AND product = ?
-      `).run(planId, plan.tier, newEnd, email, product);
+        INSERT INTO subscriptions (id, email, product, plan_id, tier, status, start_date, end_date)
+        VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+      `).run(id, email, product, planId, plan.tier, now, endDate);
+      return db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(id);
+
+    } else if (existing.status === 'active') {
+      // Active: extend or upgrade (never downgrade)
+      const baseDate = existing.end_date && new Date(existing.end_date) > new Date(now)
+        ? existing.end_date : now;
+      const newEnd = cycleDays ? addDays(baseDate, cycleDays) : null;
+
+      if (plan.price >= (existing.current_price || 0)) {
+        // Same tier or upgrade: switch plan + extend
+        db.prepare(`
+          UPDATE subscriptions SET plan_id = ?, tier = ?, end_date = ?, status = 'active'
+          WHERE email = ? AND product = ?
+        `).run(planId, plan.tier, newEnd, email, product);
+      } else {
+        // Downgrade attempt: extend at current tier
+        db.prepare(`
+          UPDATE subscriptions SET end_date = ?, status = 'active'
+          WHERE email = ? AND product = ?
+        `).run(newEnd, email, product);
+      }
+      return db.prepare('SELECT * FROM subscriptions WHERE email = ? AND product = ?').get(email, product);
+
     } else {
-      // Downgrade attempt: extend at current tier
+      // Expired or cancelled: reactivate
+      const endDate = cycleDays ? addDays(now, cycleDays) : null;
       db.prepare(`
-        UPDATE subscriptions SET end_date = ?, status = 'active'
+        UPDATE subscriptions SET plan_id = ?, tier = ?, status = 'active',
+          start_date = ?, end_date = ?, auto_renew = 0
         WHERE email = ? AND product = ?
-      `).run(newEnd, email, product);
+      `).run(planId, plan.tier, now, endDate, email, product);
+      return db.prepare('SELECT * FROM subscriptions WHERE email = ? AND product = ?').get(email, product);
     }
-    sub = db.prepare('SELECT * FROM subscriptions WHERE email = ? AND product = ?').get(email, product);
+  })();
 
-  } else {
-    // Expired or cancelled: reactivate
-    const endDate = cycleDays ? addDays(now, cycleDays) : null;
-    db.prepare(`
-      UPDATE subscriptions SET plan_id = ?, tier = ?, status = 'active',
-        start_date = ?, end_date = ?, auto_renew = 0
-      WHERE email = ? AND product = ?
-    `).run(planId, plan.tier, now, endDate, email, product);
-    sub = db.prepare('SELECT * FROM subscriptions WHERE email = ? AND product = ?').get(email, product);
-  }
-
-  // Dispatch webhook (fire-and-forget)
+  // Dispatch webhook (fire-and-forget, outside transaction)
   setImmediate(() => {
     dispatch(product, 'subscription.activated', { subscription: sub, plan }).catch(() => {});
   });
@@ -133,23 +134,26 @@ function expireCheck() {
     "SELECT * FROM subscriptions WHERE status = 'active' AND end_date IS NOT NULL AND end_date < ?"
   ).all(now);
 
-  let expired = 0;
-  for (const sub of overdue) {
-    db.prepare("UPDATE subscriptions SET status = 'expired' WHERE id = ?").run(sub.id);
-    const plan = getPlanById(sub.plan_id);
-    const updated = db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(sub.id);
+  // Batch update in transaction
+  const expiredSubs = db.transaction(() => {
+    const results = [];
+    for (const sub of overdue) {
+      db.prepare("UPDATE subscriptions SET status = 'expired' WHERE id = ?").run(sub.id);
+      const updated = db.prepare('SELECT * FROM subscriptions WHERE id = ?').get(sub.id);
+      results.push({ updated, plan: getPlanById(sub.plan_id), product: sub.product });
+    }
+    return results;
+  })();
 
+  // Dispatch webhooks outside transaction (fire-and-forget)
+  for (const { updated, plan, product } of expiredSubs) {
     setImmediate(() => {
-      dispatch(sub.product, 'subscription.expired', {
-        subscription: updated, plan,
-      }).catch(() => {});
+      dispatch(product, 'subscription.expired', { subscription: updated, plan }).catch(() => {});
     });
-
-    expired++;
   }
 
   const total = db.prepare("SELECT COUNT(*) as c FROM subscriptions WHERE status = 'active'").get().c;
-  return { expired, checked: overdue.length + total };
+  return { expired: expiredSubs.length, checked: overdue.length + total };
 }
 
 /**

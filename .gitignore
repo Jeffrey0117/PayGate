@@ -13,3 +13,6 @@ db/
 *.log
 .DS_Store
 Thumbs.db
+.pkg-hash
+.pm2-ecosystem.json
+docs/superpowers/

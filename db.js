@@ -87,6 +87,26 @@ function getDb() {
       UNIQUE(product, url)
     );
     CREATE INDEX IF NOT EXISTS idx_hooks_product ON hooks(product);
+
+    CREATE TABLE IF NOT EXISTS webhook_deliveries (
+      id            TEXT PRIMARY KEY,
+      hook_id       TEXT NOT NULL,
+      url           TEXT NOT NULL,
+      event         TEXT NOT NULL,
+      payload       TEXT NOT NULL,
+      signature     TEXT NOT NULL,
+      status        TEXT DEFAULT 'pending',
+      attempts      INTEGER DEFAULT 0,
+      max_attempts  INTEGER DEFAULT 6,
+      last_attempt  TEXT,
+      next_retry    TEXT,
+      response_code INTEGER,
+      error_message TEXT,
+      created_at    TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_wd_status ON webhook_deliveries(status);
+    CREATE INDEX IF NOT EXISTS idx_wd_next_retry ON webhook_deliveries(next_retry);
+    CREATE INDEX IF NOT EXISTS idx_wd_hook_id ON webhook_deliveries(hook_id);
   `);
 
   return db;
