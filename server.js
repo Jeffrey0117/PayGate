@@ -19,8 +19,9 @@ try {
 
 const { getDb } = require('./db');
 const { listPlans, upsertPlan, deletePlan } = require('./plans');
-const { subscribe, checkSubscription, cancelSubscription, expireCheck, handlePurchaseForSubscription } = require('./subscriptions');
+const { subscribe, checkSubscription, cancelSubscription, expireCheck, setSuspension, handlePurchaseForSubscription } = require('./subscriptions');
 const { registerHook, listHooks, deleteHook, processRetryQueue } = require('./hooks');
+const payments = require('./payments');
 
 const PORT = parseInt(process.env.PORT || '4019', 10);
 
@@ -314,6 +315,104 @@ async function handleActivate(req, res) {
   return json(res, 200, { success: true, purchaseId, subscription: subscription ? { id: subscription.id, tier: subscription.tier } : undefined });
 }
 
+// ─── One-time Payment Handlers ───
+
+function html(res, status, body) {
+  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(body);
+}
+
+async function handleCreatePayment(req, res) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  const body = await readBody(req);
+  const { session, duplicate } = payments.createPaymentSession(body);
+  return json(res, 200, {
+    success: true,
+    duplicate,
+    payment: {
+      id: session.id,
+      status: session.status,
+      product: session.product,
+      order_id: session.order_id,
+      amount: session.amount,
+      checkout_url: payments.checkoutUrlFor(session),
+    },
+  });
+}
+
+async function handleGetPayment(req, res, id) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  const session = payments.getSession(id);
+  if (!session) return json(res, 404, { error: 'Not found' });
+  return json(res, 200, { payment: session });
+}
+
+async function handleRefundPayment(req, res, id) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  const { session, duplicate } = await payments.refundPayment(id);
+  return json(res, 200, { success: true, duplicate, payment: { id: session.id, status: session.status } });
+}
+
+async function handleSimulatePayment(req, res, id) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  const { session, purchaseId, duplicate } = payments.simulatePayment(id);
+  return json(res, 200, { success: true, duplicate, purchaseId, payment: { id: session.id, status: session.status } });
+}
+
+/** Hosted checkout page: renders the auto-submit PAYUNi UPP form. */
+async function handleCheckoutPage(_req, res, id) {
+  const session = payments.getSession(id);
+  if (!session) return html(res, 404, '<h1>404</h1><p>找不到這筆付款。</p>');
+
+  if (session.status === 'paid' && session.return_url) {
+    res.writeHead(302, { Location: session.return_url });
+    return res.end();
+  }
+  if (session.status !== 'pending') {
+    return html(res, 410, `<h1>付款已結束</h1><p>狀態:${session.status}</p>`);
+  }
+
+  try {
+    return html(res, 200, payments.buildCheckoutForm(session));
+  } catch (err) {
+    console.error('[paygate] checkout form error:', err.message);
+    return html(res, 500, '<h1>付款暫時無法使用</h1><p>請稍後再試。</p>');
+  }
+}
+
+/** PAYUNi ReturnURL target: bounce the payer back to the product. */
+async function handlePaymentReturn(req, res) {
+  let params = {};
+  if (req.method === 'POST') {
+    const raw = await readRawBody(req);
+    new URLSearchParams(raw).forEach((v, k) => { params[k] = v; });
+  } else {
+    params = parseQuery(req.url);
+  }
+
+  let merTradeNo = params.MerTradeNo || '';
+  if (!merTradeNo && params.EncryptInfo) {
+    const data = decryptPayUniEncryptInfo(params.EncryptInfo);
+    if (data) merTradeNo = data.MerTradeNo || '';
+  }
+
+  const session = merTradeNo ? payments.getSessionByMerTradeNo(merTradeNo) : null;
+  if (session && session.return_url) {
+    const sep = session.return_url.includes('?') ? '&' : '?';
+    res.writeHead(302, { Location: `${session.return_url}${sep}payment=${session.status}` });
+    return res.end();
+  }
+  return html(res, 200, '<h1>付款完成</h1><p>請回到原網站查看訂單狀態。</p>');
+}
+
 // ─── Plans Handlers ───
 
 async function handleListPlans(req, res) {
@@ -379,6 +478,19 @@ async function handleExpireCheck(req, res) {
   return json(res, 200, result);
 }
 
+// 停權 / 恢復(退費處理用)。body: { email, product, suspended:bool, reason? }
+async function handleSetSuspension(req, res) {
+  if (!requireAuth(req, 'PAYGATE_TOKEN')) {
+    return json(res, 401, { error: 'Unauthorized' });
+  }
+  const body = await readBody(req);
+  if (!body.email || !body.product) {
+    return json(res, 400, { error: 'email and product are required' });
+  }
+  const sub = setSuspension(body.email, body.product, body.suspended === true, body.reason);
+  return json(res, 200, { success: true, subscription: sub });
+}
+
 // ─── Hook Handlers ───
 
 async function handleCreateHook(req, res) {
@@ -429,6 +541,11 @@ function decryptPayUniEncryptInfo(encryptStr) {
   const hashIV = process.env.PAYUNI_HASH_IV;
   if (!hashKey || !hashIV) return null;
 
+  // Official format: hex( base64(ct) + ":::" + base64(tag) )
+  const official = payments.decryptPayUniInfo(encryptStr);
+  if (official) return official;
+
+  // Legacy fallback: hex( rawCipherBytes + ":::" + base64(tag) )
   try {
     const raw = Buffer.from(encryptStr, 'hex');
     const sepIdx = raw.indexOf(':::');
@@ -513,8 +630,29 @@ async function handlePayUniWebhook(req, res) {
   // Only process successful payments
   const isSuccess = status === 'SUCCESS' || status === '1';
   if (!isSuccess) {
+    // A known one-time payment session that failed → mark it so the product can retry.
+    if (orderNo) {
+      const session = payments.getSessionByMerTradeNo(orderNo);
+      if (session && session.status === 'pending') {
+        console.log(`[paygate] payment session ${session.id} failed, status: ${status}`);
+      }
+    }
     console.log('[paygate] PAYUNi: payment not successful, status:', status);
     return json(res, 200, { success: true, message: 'Status noted', status });
+  }
+
+  // One-time payment sessions take priority over plan matching.
+  if (orderNo) {
+    const session = payments.getSessionByMerTradeNo(orderNo);
+    if (session) {
+      const { purchaseId, duplicate } = payments.completePaymentSession(session.id, {
+        tradeNo,
+        source: 'payuni',
+        rawPayload: data,
+      });
+      console.log(`[paygate] payment session ${session.id} completed (purchase ${purchaseId}${duplicate ? ', duplicate' : ''})`);
+      return json(res, 200, { success: true, purchaseId, paymentId: session.id, duplicate });
+    }
   }
 
   // Match amount to plan (search ALL products)
@@ -711,6 +849,30 @@ function matchRoute(method, pathname) {
     return { handler: handleListPurchases, params: [email] };
   }
 
+  // One-time payments
+  if (method === 'POST' && pathname === '/api/payments/create') {
+    return { handler: handleCreatePayment };
+  }
+  const payRefundMatch = pathname.match(/^\/api\/payments\/([^/]+)\/refund$/);
+  if (method === 'POST' && payRefundMatch) {
+    return { handler: handleRefundPayment, params: [payRefundMatch[1]] };
+  }
+  const paySimulateMatch = pathname.match(/^\/api\/payments\/([^/]+)\/simulate$/);
+  if (method === 'POST' && paySimulateMatch) {
+    return { handler: handleSimulatePayment, params: [paySimulateMatch[1]] };
+  }
+  const payGetMatch = pathname.match(/^\/api\/payments\/([^/]+)$/);
+  if (method === 'GET' && payGetMatch) {
+    return { handler: handleGetPayment, params: [payGetMatch[1]] };
+  }
+  if (pathname === '/pay/return' && (method === 'POST' || method === 'GET')) {
+    return { handler: handlePaymentReturn };
+  }
+  const payPageMatch = pathname.match(/^\/pay\/([^/]+)$/);
+  if (method === 'GET' && payPageMatch && payPageMatch[1] !== 'return') {
+    return { handler: handleCheckoutPage, params: [payPageMatch[1]] };
+  }
+
   // Plans
   if (method === 'GET' && pathname === '/api/plans') {
     return { handler: handleListPlans };
@@ -729,6 +891,9 @@ function matchRoute(method, pathname) {
   }
   if (method === 'POST' && pathname === '/api/subscribe') {
     return { handler: handleSubscribe };
+  }
+  if (method === 'POST' && pathname === '/api/subscription/suspend') {
+    return { handler: handleSetSuspension };
   }
   if (method === 'POST' && pathname === '/api/subscriptions/expire-check') {
     return { handler: handleExpireCheck };

@@ -95,6 +95,11 @@ function checkSubscription(email, product) {
     return { active: false };
   }
 
+  // Suspended (退費處理中):一律視為未訂閱,擋住使用
+  if (sub.suspended) {
+    return { active: false, suspended: true };
+  }
+
   // Check expiry
   if (sub.end_date && new Date(sub.end_date) < new Date()) {
     return { active: false, expired: true };
@@ -157,6 +162,31 @@ function expireCheck() {
 }
 
 /**
+ * 停權 / 恢復(退費處理用)。保留訂閱本身不變,只用 suspended 旗標擋住。
+ * checkSubscription 遇 suspended 一律回 active:false。
+ */
+function setSuspension(email, product, suspended, reason) {
+  const db = getDb();
+  const sub = db.prepare('SELECT * FROM subscriptions WHERE email = ? AND product = ?').get(email, product);
+  if (!sub) throw new Error('Subscription not found');
+
+  db.prepare(
+    'UPDATE subscriptions SET suspended = ?, suspended_reason = ? WHERE email = ? AND product = ?'
+  ).run(suspended ? 1 : 0, suspended ? (reason || '已申請退費') : null, email, product);
+
+  const updated = db.prepare('SELECT * FROM subscriptions WHERE email = ? AND product = ?').get(email, product);
+  const plan = getPlanById(sub.plan_id);
+
+  setImmediate(() => {
+    dispatch(product, suspended ? 'subscription.suspended' : 'subscription.resumed', {
+      subscription: updated, plan, reason: reason || null,
+    }).catch(() => {});
+  });
+
+  return updated;
+}
+
+/**
  * Called from webhook handler when a purchase matches a plan's cb_product_id.
  * Returns the subscription if created, or null if no matching plan.
  */
@@ -167,6 +197,6 @@ function handlePurchaseForSubscription(email, cbProductId) {
 }
 
 module.exports = {
-  subscribe, checkSubscription, cancelSubscription, expireCheck,
+  subscribe, checkSubscription, cancelSubscription, expireCheck, setSuspension,
   handlePurchaseForSubscription,
 };

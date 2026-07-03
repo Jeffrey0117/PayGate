@@ -1,0 +1,58 @@
+# Dependencies (rebuilt in Docker)
+node_modules/
+
+# Build output
+.next/
+dist/
+build/
+out/
+
+# Runtime data (mounted as volume)
+data/
+uploads/
+storage/
+db/
+*.db
+*.sqlite
+*.sqlite3
+
+# Git
+.git/
+.gitignore
+
+# Environment
+.env
+.env.*
+
+# Tests
+__tests__/
+tests/
+test/
+test-*.js
+*.test.js
+*.test.ts
+coverage/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE / temp
+.claude/
+.claudebot.lock
+.vscode/
+.idea/
+*.log
+*.md
+!README.md
+nul
+*.swp
+*.swo
+
+# Misc
+.turbo/
+.vercel/
+*.bak

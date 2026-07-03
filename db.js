@@ -76,6 +76,26 @@ function getDb() {
       UPDATE subscriptions SET updated_at = datetime('now') WHERE id = NEW.id;
     END;
 
+    CREATE TABLE IF NOT EXISTS payment_sessions (
+      id            TEXT PRIMARY KEY,
+      product       TEXT NOT NULL,
+      order_id      TEXT NOT NULL,
+      email         TEXT DEFAULT '',
+      amount        INTEGER NOT NULL,
+      currency      TEXT DEFAULT 'TWD',
+      item_desc     TEXT DEFAULT '',
+      return_url    TEXT DEFAULT '',
+      status        TEXT DEFAULT 'pending',
+      mer_trade_no  TEXT UNIQUE,
+      trade_no      TEXT,
+      purchase_id   TEXT,
+      created_at    TEXT DEFAULT (datetime('now')),
+      updated_at    TEXT DEFAULT (datetime('now')),
+      UNIQUE(product, order_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_ps_mer_trade_no ON payment_sessions(mer_trade_no);
+    CREATE INDEX IF NOT EXISTS idx_ps_status ON payment_sessions(status);
+
     CREATE TABLE IF NOT EXISTS hooks (
       id            TEXT PRIMARY KEY,
       product       TEXT NOT NULL,
@@ -108,6 +128,14 @@ function getDb() {
     CREATE INDEX IF NOT EXISTS idx_wd_next_retry ON webhook_deliveries(next_retry);
     CREATE INDEX IF NOT EXISTS idx_wd_hook_id ON webhook_deliveries(hook_id);
   `);
+
+  // 後加欄位:停權(退費處理用)。欄位已存在時 ALTER 會丟錯 → 忽略即可(等同 migration)。
+  for (const stmt of [
+    "ALTER TABLE subscriptions ADD COLUMN suspended INTEGER DEFAULT 0",
+    "ALTER TABLE subscriptions ADD COLUMN suspended_reason TEXT",
+  ]) {
+    try { db.exec(stmt); } catch { /* 欄位已存在,略過 */ }
+  }
 
   return db;
 }
