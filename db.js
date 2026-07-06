@@ -129,13 +129,18 @@ function getDb() {
     CREATE INDEX IF NOT EXISTS idx_wd_hook_id ON webhook_deliveries(hook_id);
   `);
 
-  // 後加欄位:停權(退費處理用)。欄位已存在時 ALTER 會丟錯 → 忽略即可(等同 migration)。
+  // 後加欄位。欄位已存在時 ALTER 會丟錯 → 忽略即可(等同 migration)。
+  // - subscriptions.suspended / suspended_reason:停權(退費處理用)
+  // - plans.prefix:訂單前綴(MerTradeNo 開頭),用來 prefix-first 對應到正確商品
   for (const stmt of [
     "ALTER TABLE subscriptions ADD COLUMN suspended INTEGER DEFAULT 0",
     "ALTER TABLE subscriptions ADD COLUMN suspended_reason TEXT",
+    "ALTER TABLE plans ADD COLUMN prefix TEXT",
   ]) {
     try { db.exec(stmt); } catch { /* 欄位已存在,略過 */ }
   }
+  // Index needs the column to exist first, so it runs after the ALTER above.
+  try { db.exec("CREATE INDEX IF NOT EXISTS idx_plans_prefix ON plans(prefix)"); } catch { /* 略過 */ }
 
   return db;
 }

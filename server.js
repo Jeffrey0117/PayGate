@@ -18,7 +18,8 @@ try {
 } catch {}
 
 const { getDb } = require('./db');
-const { listPlans, upsertPlan, deletePlan } = require('./plans');
+const { listPlans, listPrefixes, upsertPlan, deletePlan } = require('./plans');
+const { matchPayment } = require('./matching');
 const { subscribe, checkSubscription, cancelSubscription, expireCheck, setSuspension, handlePurchaseForSubscription } = require('./subscriptions');
 const { registerHook, listHooks, deleteHook, processRetryQueue } = require('./hooks');
 const payments = require('./payments');
@@ -426,8 +427,22 @@ async function handleCreatePlan(req, res) {
     return json(res, 401, { error: 'Unauthorized' });
   }
   const body = await readBody(req);
-  const plan = upsertPlan(body);
-  return json(res, 200, { success: true, plan });
+  try {
+    const plan = upsertPlan(body);
+    return json(res, 200, { success: true, plan });
+  } catch (err) {
+    // Prefix conflict (409) / bad prefix format (400) carry an explicit status.
+    if (err.status === 409 || err.status === 400) {
+      return json(res, err.status, { error: err.message });
+    }
+    throw err;
+  }
+}
+
+// Public prefix registry: { prefix → product }. Lets external tools check
+// availability before registering a plan (matches GET /api/plans being public).
+async function handleListPrefixes(_req, res) {
+  return json(res, 200, { prefixes: listPrefixes() });
 }
 
 async function handleDeletePlan(req, res, id) {
@@ -655,15 +670,23 @@ async function handlePayUniWebhook(req, res) {
     }
   }
 
-  // Match amount to plan (search ALL products)
+  // Prefix-first plan matching: the order's MerTradeNo prefix (e.g. "LS17299…")
+  // pins it to one product, so two products sharing a price no longer collide.
+  // Unregistered prefixes fall back to the original global amount match.
   const allPlans = listPlans(); // no product filter
-  const candidates = allPlans.filter(p => p.price === amount);
-  let matchedPlan = candidates[0] || null;
-  if (candidates.length > 1) {
-    console.warn(`[paygate] PAYUNi: ${candidates.length} plans match amount ${amount}: ${candidates.map(p => p.id).join(', ')}. Using first match.`);
+  const match = matchPayment({ merTradeNo: orderNo, amount, plans: allPlans });
+  const matchedPlan = match.matchedPlan;
+
+  if (match.path === 'prefix') {
+    console.log(`[paygate] PAYUNi: prefix "${match.prefix}" → product "${match.product}"; ${match.candidates.length} plan(s) match amount ${amount} within product`);
+  } else {
+    console.log(`[paygate] PAYUNi: no registered prefix for MerTradeNo "${orderNo}" → global amount match (amount ${amount})`);
+    if (match.candidates.length > 1) {
+      console.warn(`[paygate] PAYUNi: ${match.candidates.length} plans match amount ${amount}: ${match.candidates.map(p => p.id).join(', ')}. Using first match.`);
+    }
   }
 
-  const productId = matchedPlan ? matchedPlan.product : 'unknown';
+  const productId = match.product || (matchedPlan ? matchedPlan.product : 'unknown');
 
   if (!matchedPlan) {
     console.log(`[paygate] PAYUNi: no plan matches amount ${amount}`);
@@ -874,6 +897,9 @@ function matchRoute(method, pathname) {
   }
 
   // Plans
+  if (method === 'GET' && pathname === '/api/prefixes') {
+    return { handler: handleListPrefixes };
+  }
   if (method === 'GET' && pathname === '/api/plans') {
     return { handler: handleListPlans };
   }
